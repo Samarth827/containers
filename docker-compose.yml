@@ -1,0 +1,85 @@
+version: "3.9"
+
+services:
+  cpu_burner:
+    image: alpine:3.19
+    container_name: cpu_burner
+    command:
+      - /bin/sh
+      - -c
+      - |
+        echo "Starting busy loop to generate CPU pressure";
+        while true; do :; done
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+    labels:
+      com.example.cgroup_path: "/sys/fs/cgroup/containers/cpu_burner"
+    restart: unless-stopped
+
+  memory_hog:
+    image: python:3.12-slim
+    container_name: memory_hog
+    command:
+      - python
+      - -u
+      - -c
+      - |
+        import time
+        import sys
+        blocks = []
+        block_size = 20 * 1024 * 1024  # 20 MiB
+        limit = 40
+        for i in range(limit):
+          blocks.append(bytearray(block_size))
+          time.sleep(2)
+        time.sleep(3600)
+    environment:
+      PYTHONUNBUFFERED: "1"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 512M
+        reservations:
+          cpus: "0.10"
+          memory: 128M
+    labels:
+      com.example.cgroup_path: "/sys/fs/cgroup/containers/memory_hog"
+    restart: unless-stopped
+
+  io_tester:
+    image: alpine:3.19
+    container_name: io_tester
+    command:
+      - /bin/sh
+      - -c
+      - |
+        echo "Starting disk writer/reader";
+        while true; do
+          dd if=/dev/urandom of=/data/blob bs=1M count=128 oflag=direct
+          dd if=/data/blob of=/dev/null bs=1M iflag=direct
+        done
+    volumes:
+      - ./experiments/data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
+        reservations:
+          cpus: "0.10"
+          memory: 64M
+    labels:
+      com.example.cgroup_path: "/sys/fs/cgroup/containers/io_tester"
+    restart: unless-stopped
+
+networks:
+  default:
+    driver: bridge
+

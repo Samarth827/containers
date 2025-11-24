@@ -1,0 +1,62 @@
+events:
+  sink: "./logs/events.jsonl"
+  sample_interval_ms: 2000
+
+containers:
+  cpu_burner:
+    cgroup_path: "/sys/fs/cgroup/containers/cpu_burner"
+    cpu:
+      period_us: 100000
+      soft_quota_us: 40000
+      hard_quota_us: 80000
+      adjust_step_us: 5000
+    memory:
+      soft_bytes: 268435456     # 256 MiB
+      hard_bytes: 402653184     # 384 MiB
+      adjust_step_bytes: 33554432
+    io:
+      device: "8:0"            # update to match your block device
+      soft_rbps: 8388608
+      soft_wbps: 8388608
+      hard_rbps: 16777216
+      hard_wbps: 16777216
+      adjust_step_bps: 1048576
+
+  memory_hog:
+    cgroup_path: "/sys/fs/cgroup/containers/memory_hog"
+    cpu:
+      period_us: 100000
+      soft_quota_us: 20000
+      hard_quota_us: 50000
+      adjust_step_us: 5000
+    memory:
+      soft_bytes: 402653184     # 384 MiB
+      hard_bytes: 644245094     # 600 MiB
+      adjust_step_bytes: 33554432
+    io:
+      device: "8:0"
+      soft_rbps: 6291456
+      soft_wbps: 6291456
+      hard_rbps: 12582912
+      hard_wbps: 12582912
+      adjust_step_bps: 1048576
+
+  io_tester:
+    cgroup_path: "/sys/fs/cgroup/containers/io_tester"
+    cpu:
+      period_us: 100000
+      soft_quota_us: 30000
+      hard_quota_us: 60000
+      adjust_step_us: 5000
+    memory:
+      soft_bytes: 268435456
+      hard_bytes: 402653184
+      adjust_step_bytes: 33554432
+    io:
+      device: "8:0"
+      soft_rbps: 4194304
+      soft_wbps: 4194304
+      hard_rbps: 10485760
+      hard_wbps: 10485760
+      adjust_step_bps: 524288
+
