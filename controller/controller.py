@@ -1,11 +1,16 @@
 import argparse
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
 
 import yaml
+
+try:
+    from .ml_policy import SoftLimitPolicy
+except ImportError:
+    from ml_policy import SoftLimitPolicy
 
 
 def load_config(path: Path) -> Dict:
@@ -32,6 +37,7 @@ class ResourceState:
     memory_soft: Optional[int] = None
     io_soft_rbps: Optional[int] = None
     io_soft_wbps: Optional[int] = None
+    pending_eval: Optional[Dict[str, float]] = None
 
 
 class Controller:
@@ -39,18 +45,48 @@ class Controller:
         self.config = config
         self.events_path = Path(config["events"]["sink"])
         self.interval = config["events"].get("sample_interval_ms", 2000) / 1000
+        metrics_cfg = config.get("metrics", {})
+        self.samples_path = Path(metrics_cfg["samples_sink"]) if metrics_cfg.get("samples_sink") else None
         self.dry_run = dry_run
         self.state: Dict[str, ResourceState] = {}
+        ml_cfg = config.get("ml", {})
+        model_path = ml_cfg.get("model_path")
+        self.policy: Optional[SoftLimitPolicy] = None
+        if model_path:
+            candidate = Path(model_path)
+            if candidate.exists():
+                self.policy = SoftLimitPolicy(candidate)
+            else:
+                print(f"[controller] ML model {candidate} not found; falling back to heuristic adjustments.")
 
     def run(self) -> None:
         while True:
+            loop_ts = time.time()
             for name, payload in self.config["containers"].items():
                 self.state.setdefault(name, ResourceState())
                 self.ensure_base_limits(name, payload)
-                self.adjust_cpu(name, payload)
-                self.adjust_memory(name, payload)
-                self.adjust_io(name, payload)
+                stats = self.collect_stats(payload)
+                cpu_meta = self.adjust_cpu(name, payload, stats)
+                mem_meta = self.adjust_memory(name, payload, stats)
+                io_meta = self.adjust_io(name, payload, stats)
+                self.record_training_sample(name, payload, stats, cpu_meta, mem_meta, io_meta, loop_ts)
             time.sleep(self.interval)
+
+    def collect_stats(self, payload: Dict) -> Dict:
+        cgroup = Path(payload["cgroup_path"])
+        cpu_stat = {}
+        mem_current = None
+        io_metrics = {}
+        cpu_path = cgroup / "cpu.stat"
+        if cpu_path.exists():
+            cpu_stat = self.parse_key_value(cpu_path)
+        mem_path = cgroup / "memory.current"
+        if mem_path.exists():
+            mem_current = self.read_int(mem_path)
+        io_path = cgroup / "io.stat"
+        if io_path.exists():
+            io_metrics = self.parse_io_stat(io_path, payload["io"]["device"])
+        return {"cpu_stat": cpu_stat, "memory_current": mem_current, "io_metrics": io_metrics}
 
     def ensure_base_limits(self, name: str, payload: Dict) -> None:
         cgroup = Path(payload["cgroup_path"])
@@ -108,21 +144,45 @@ class Controller:
     def read_int(self, path: Path) -> int:
         return int(path.read_text(encoding="utf-8").strip())
 
-    def adjust_cpu(self, name: str, payload: Dict) -> None:
+    def adjust_cpu(self, name: str, payload: Dict, stats: Dict) -> Dict:
         cgroup = Path(payload["cgroup_path"])
         cpu = payload["cpu"]
         state = self.state[name]
-        stat_path = cgroup / "cpu.stat"
-        if not stat_path.exists():
-            return
-        stat = self.parse_key_value(stat_path)
+        stat = stats["cpu_stat"]
+        if not stat:
+            return {"usage_delta": 0, "throttled_delta": 0, "usage": 0, "throttled": 0, "soft": state.cpu_soft}
         usage = int(stat.get("usage_usec", 0))
         throttled = int(stat.get("throttled_usec", 0))
+        usage_delta = 0
+        throttled_delta = 0
         if state.last_cpu_usage is not None:
             usage_delta = max(usage - state.last_cpu_usage, 0)
             throttled_delta = max(throttled - state.last_cpu_throttled, 0)
+            if state.pending_eval:
+                prev = state.pending_eval
+                improvement = prev["prev_delta"] - throttled_delta
+                event_type = "ml_effective" if throttled_delta < prev["prev_delta"] else "ml_no_improvement"
+                self.emit(
+                    event_type,
+                    f"{name} ML adjustment impact: Δthrottle={throttled_delta} vs prev {prev['prev_delta']}",
+                    {
+                        "resource": "cpu",
+                        "container": name,
+                        "previous_delta": prev["prev_delta"],
+                        "current_delta": throttled_delta,
+                        "applied_soft_quota_us": prev["new_soft"],
+                        "improvement": improvement,
+                        "elapsed_sec": time.time() - prev["time"],
+                    },
+                )
+                state.pending_eval = None
             if throttled_delta > 0 and state.cpu_soft < cpu["hard_quota_us"]:
-                new_soft = min(state.cpu_soft + cpu["adjust_step_us"], cpu["hard_quota_us"])
+                suggested = self.suggest_cpu_soft_limit(
+                    name, payload, stats, cpu_meta={"usage_delta": usage_delta, "throttled_delta": throttled_delta}
+                )
+                ml_used = suggested is not None
+                previous_soft = state.cpu_soft
+                new_soft = suggested or min(state.cpu_soft + cpu["adjust_step_us"], cpu["hard_quota_us"])
                 self.emit(
                     "soft_limit_hit",
                     f"{name} CPU throttled ({throttled_delta} usec); raising soft quota to {new_soft}",
@@ -130,6 +190,24 @@ class Controller:
                 )
                 state.cpu_soft = new_soft
                 self.write_cpu_max(cgroup, new_soft, cpu["period_us"])
+                if ml_used:
+                    state.pending_eval = {
+                        "prev_delta": throttled_delta,
+                        "new_soft": new_soft,
+                        "previous_soft": previous_soft,
+                        "time": time.time(),
+                    }
+                    self.emit(
+                        "ml_adjustment",
+                        f"{name} ML suggested raising CPU soft quota to {new_soft}",
+                        {
+                            "resource": "cpu",
+                            "container": name,
+                            "previous_soft_quota_us": previous_soft,
+                            "new_soft_quota_us": new_soft,
+                            "throttled_delta_usec": throttled_delta,
+                        },
+                    )
             elif throttled_delta > 0 and state.cpu_soft >= cpu["hard_quota_us"]:
                 self.emit(
                     "hard_limit_hit",
@@ -138,15 +216,47 @@ class Controller:
                 )
         state.last_cpu_usage = usage
         state.last_cpu_throttled = throttled
+        return {
+            "usage_delta": usage_delta,
+            "throttled_delta": throttled_delta,
+            "usage": usage,
+            "throttled": throttled,
+            "soft": state.cpu_soft,
+        }
 
-    def adjust_memory(self, name: str, payload: Dict) -> None:
+    def suggest_cpu_soft_limit(self, name: str, payload: Dict, stats: Dict, cpu_meta: Dict) -> Optional[int]:
+        if not self.policy:
+            return None
+        state = self.state[name]
+        hard_cap = payload["cpu"]["hard_quota_us"]
+        soft = state.cpu_soft
+        period = payload["cpu"]["period_us"] or 1
+        usage_delta = cpu_meta.get("usage_delta", 0)
+        throttle_delta = cpu_meta.get("throttled_delta", 0)
+        usage_ratio = usage_delta / period
+        throttle_ratio = throttle_delta / period
+        memory_ratio = None
+        memory_current = stats.get("memory_current")
+        memory_soft = state.memory_soft
+        if memory_current is not None and memory_soft:
+            memory_ratio = memory_current / max(memory_soft, 1)
+        io_metrics = stats.get("io_metrics") or {}
+        features = {
+            "usage_ratio": usage_ratio,
+            "throttle_ratio": throttle_ratio,
+            "memory_ratio": memory_ratio or 0.0,
+            "rbps": io_metrics.get("rbps", 0.0),
+            "wbps": io_metrics.get("wbps", 0.0),
+        }
+        return self.policy.suggest(features, hard_cap, soft)
+
+    def adjust_memory(self, name: str, payload: Dict, stats: Dict) -> Dict:
         cgroup = Path(payload["cgroup_path"])
         memory = payload["memory"]
         state = self.state[name]
-        current_path = cgroup / "memory.current"
-        if not current_path.exists():
-            return
-        current_val = self.read_int(current_path)
+        current_val = stats["memory_current"]
+        if current_val is None:
+            return {"current": None, "soft": state.memory_soft}
         if state.memory_soft is None:
             state.memory_soft = memory["soft_bytes"]
         threshold = state.memory_soft * 0.95
@@ -165,14 +275,14 @@ class Controller:
                 f"{name} memory usage {current_val} exceeded hard limit {memory['hard_bytes']}",
                 {"resource": "memory", "container": name, "value": current_val},
             )
+        return {"current": current_val, "soft": state.memory_soft, "hard": memory["hard_bytes"]}
 
-    def adjust_io(self, name: str, payload: Dict) -> None:
+    def adjust_io(self, name: str, payload: Dict, stats: Dict) -> Dict:
         cgroup = Path(payload["cgroup_path"])
         io_cfg = payload["io"]
-        stat_path = cgroup / "io.stat"
-        if not stat_path.exists():
-            return
-        metrics = self.parse_io_stat(stat_path, io_cfg["device"])
+        metrics = stats["io_metrics"]
+        if not metrics:
+            return {"metrics": {}, "soft_rbps": self.state[name].io_soft_rbps, "soft_wbps": self.state[name].io_soft_wbps}
         state = self.state[name]
         rbps = metrics.get("rbps", 0)
         wbps = metrics.get("wbps", 0)
@@ -200,6 +310,53 @@ class Controller:
                 f"{name} IO throughput reached hard limit",
                 {"resource": "io", "container": name, "rbps": rbps, "wbps": wbps},
             )
+        return {
+            "metrics": metrics,
+            "soft_rbps": state.io_soft_rbps,
+            "soft_wbps": state.io_soft_wbps,
+            "hard_rbps": io_cfg["hard_rbps"],
+            "hard_wbps": io_cfg["hard_wbps"],
+        }
+
+    def record_training_sample(
+        self,
+        name: str,
+        payload: Dict,
+        stats: Dict,
+        cpu_meta: Dict,
+        mem_meta: Dict,
+        io_meta: Dict,
+        timestamp: float,
+    ) -> None:
+        if self.dry_run or not self.samples_path:
+            return
+        sample = {
+            "time": timestamp,
+            "source": "controller",
+            "container": name,
+            "cpu": {
+                "soft_quota_us": cpu_meta.get("soft"),
+                "hard_quota_us": payload["cpu"]["hard_quota_us"],
+                "period_us": payload["cpu"]["period_us"],
+                "usage_usec": cpu_meta.get("usage"),
+                "usage_delta_usec": cpu_meta.get("usage_delta"),
+                "throttled_usec": cpu_meta.get("throttled"),
+                "throttled_delta_usec": cpu_meta.get("throttled_delta"),
+            },
+            "memory": {
+                "current_bytes": mem_meta.get("current"),
+                "soft_bytes": mem_meta.get("soft"),
+                "hard_bytes": payload["memory"]["hard_bytes"],
+            },
+            "io": {
+                "metrics": io_meta.get("metrics", {}),
+                "soft_rbps": io_meta.get("soft_rbps"),
+                "soft_wbps": io_meta.get("soft_wbps"),
+                "hard_rbps": io_meta.get("hard_rbps", payload["io"]["hard_rbps"]),
+                "hard_wbps": io_meta.get("hard_wbps", payload["io"]["hard_wbps"]),
+            },
+        }
+        append_json(self.samples_path, sample)
 
     def parse_key_value(self, path: Path) -> Dict[str, str]:
         result: Dict[str, str] = {}

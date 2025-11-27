@@ -2,6 +2,12 @@ events:
   sink: "./logs/events.jsonl"
   sample_interval_ms: 2000
 
+metrics:
+  samples_sink: "./logs/training_samples.jsonl"
+
+ml:
+  model_path: "./models/soft_limit_linear.pkl"
+
 containers:
   cpu_burner:
     cgroup_path: "/sys/fs/cgroup/containers/cpu_burner"
